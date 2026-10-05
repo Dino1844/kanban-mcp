@@ -138,12 +138,13 @@ mcpServer.tool(
       content: [
         {
           type: "text",
-          text: `Added task "${title}" to "${column.name}" column in board "${board.name}":\n\n${content}`,
+          text: `Added task "${title}" to "${column.name}" column in board "${board.name}".\n\nTask ID: ${task.id}\nColumn ID: ${board.landing_column_id}\nBoard ID: ${boardId}\nPosition: ${task.position}\n\n${content}`,
         },
       ],
       taskInfo: {
         id: task.id,
         columnId: board.landing_column_id,
+        boardId,
         title,
         content,
         position: task.position,
@@ -156,13 +157,14 @@ mcpServer.tool(
 
 mcpServer.tool(
   "move-task",
-  "Move a task from one column to another, respecting WIP limits. Only move tasks into the Done column if the user approved that the task is done. When moving to Done, provide a short reason for completion.",
+  "Move a task from one column to another, respecting WIP limits. Only move tasks into the Done column if the user approved that the task is done. When moving to Done, a short reason is required. You can specify the target column by ID (targetColumnId) or by name (targetColumnName).",
   {
     taskId: z.string(),
-    targetColumnId: z.string(),
+    targetColumnId: z.string().optional(),
+    targetColumnName: z.string().optional(),
     reason: z.string().optional(),
   },
-  async ({ taskId, targetColumnId, reason }) => {
+  async ({ taskId, targetColumnId, targetColumnName, reason }) => {
     const task = kanbanDB.getTaskById(taskId);
 
     if (!task) {
@@ -177,8 +179,61 @@ mcpServer.tool(
       };
     }
 
+    if (!targetColumnId && !targetColumnName) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error: Provide either targetColumnId or targetColumnName.`,
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    let resolvedTargetColumnId = targetColumnId;
+
+    if (!resolvedTargetColumnId && targetColumnName) {
+      const sourceColumnForBoard = kanbanDB.getColumnById(task.column_id);
+
+      if (!sourceColumnForBoard) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Error: Could not find source column with ID: ${task.column_id}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      const boardColumns = kanbanDB.getColumnsForBoard(
+        sourceColumnForBoard.board_id
+      );
+      const matched = boardColumns.find(
+        (col) => col.name.toLowerCase() === targetColumnName.toLowerCase()
+      );
+
+      if (!matched) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Error: Could not find column named "${targetColumnName}" in this board. Available columns: ${boardColumns
+                .map((col) => col.name)
+                .join(", ")}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      resolvedTargetColumnId = matched.id;
+    }
+
     // If the task is already in the target column, no need to move
-    if (task.column_id === targetColumnId) {
+    if (task.column_id === resolvedTargetColumnId) {
       return {
         content: [
           {
@@ -190,14 +245,27 @@ mcpServer.tool(
       };
     }
 
-    const targetColumn = kanbanDB.getColumnById(targetColumnId);
+    const targetColumn = kanbanDB.getColumnById(resolvedTargetColumnId!);
 
     if (!targetColumn) {
       return {
         content: [
           {
             type: "text",
-            text: `Error: Could not find target column with ID: ${targetColumnId}`,
+            text: `Error: Could not find target column with ID: ${resolvedTargetColumnId}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    // Moving into a Done column requires a completion reason
+    if (targetColumn.is_done_column === 1 && (!reason || !reason.trim())) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error: A reason is required when moving a task to the "${targetColumn.name}" (Done) column. Provide a short completion reason.`,
           },
         ],
         isError: true,
@@ -219,7 +287,7 @@ mcpServer.tool(
     }
 
     try {
-      kanbanDB.moveTask(taskId, targetColumnId, reason);
+      kanbanDB.moveTask(taskId, resolvedTargetColumnId!, reason);
     } catch (error) {
       if (error instanceof ColumnCapacityFullError) {
         return {
@@ -289,12 +357,59 @@ mcpServer.tool(
 );
 
 mcpServer.tool(
-  "get-board-info",
-  "Get the full info of a kanban board, including columns and tasks (without task content).",
+  "delete-board",
+  "Delete a kanban board and all of its columns and tasks. Use with caution; this cannot be undone.",
   {
     boardId: z.string(),
   },
   async ({ boardId }) => {
+    const board = kanbanDB.getBoardById(boardId);
+
+    if (!board) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error: Could not find board with ID: ${boardId}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    const changes = kanbanDB.deleteBoard(boardId);
+
+    if (changes) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Deleted board "${board.name}" (ID: ${boardId}) and all its columns and tasks.`,
+          },
+        ],
+      };
+    }
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Error: Could not delete board with ID: ${boardId}`,
+        },
+      ],
+      isError: true,
+    };
+  }
+);
+
+mcpServer.tool(
+  "get-board-info",
+  "Get the full info of a kanban board, including columns and tasks (without task content). Set includeContent to true to also include each task's content.",
+  {
+    boardId: z.string(),
+    includeContent: z.boolean().optional(),
+  },
+  async ({ boardId, includeContent }) => {
     const boardData = kanbanDB.getBoardWithColumnsAndTasks(boardId);
 
     if (!boardData) {
@@ -337,7 +452,16 @@ mcpServer.tool(
                   taskInfo += `, Update reason: ${task.updateReason}`;
                 }
 
-                return taskInfo + ")";
+                taskInfo += ")";
+
+                if (includeContent) {
+                  const full = kanbanDB.getTaskById(task.id);
+                  if (full) {
+                    taskInfo += `\n  Content: ${full.content.replace(/\n/g, "\n  ")}`;
+                  }
+                }
+
+                return taskInfo;
               }
             )
             .join("\n")

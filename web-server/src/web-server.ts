@@ -248,8 +248,10 @@ class WebServer {
    */
   async start(): Promise<void> {
     try {
-      await this.server.listen({ port: 8221, host: "localhost" });
-      console.log(`Server is running at http://localhost:8221`);
+      const host = process.env.KANBAN_WEB_HOST ?? "localhost";
+      const port = Number(process.env.KANBAN_WEB_PORT ?? 8221);
+      await this.server.listen({ port, host });
+      console.log(`Server is running at http://${host}:${port}`);
     } catch (err) {
       this.server.log.error(err);
       process.exit(1);
