@@ -21,6 +21,13 @@ const folderPath = process.env.MCP_KANBAN_DB_FOLDER_PATH ?? "./db";
 const db = createDBInstance(folderPath);
 const kanbanDB = new KanbanDB(db);
 
+// Resolve a board by ID or by name (agent often knows the name from list-boards).
+function resolveBoard(idOrName: string) {
+  const byId = kanbanDB.getBoardById(idOrName);
+  if (byId) return byId;
+  return kanbanDB.getBoardByName(idOrName);
+}
+
 mcpServer.tool(
   "create-kanban-board",
   "Create a new kanban board to plan and keep track of your tasks. Specify the goal of the project in 1-3 sentences.",
@@ -63,23 +70,55 @@ mcpServer.tool(
     boardId: z.string(),
     title: z.string(),
     content: z.string(),
+    columnId: z.string().optional(),
+    columnName: z.string().optional(),
+    priority: z.string().optional(),
+    metadata: z.any().optional(),
   },
-  async ({ boardId, title, content }) => {
-    const board = kanbanDB.getBoardById(boardId);
+  async ({ boardId, title, content, columnId, columnName, priority, metadata }) => {
+    const board = resolveBoard(boardId);
 
     if (!board) {
       return {
         content: [
           {
             type: "text",
-            text: `Error: Could not find board with ID: ${boardId}`,
+            text: `Error: Could not find board with ID or name: ${boardId}`,
           },
         ],
         isError: true,
       };
     }
 
-    if (!board.landing_column_id) {
+    // Determine target column: explicit columnId/columnName, else landing column
+    let targetColumnId: string | undefined;
+
+    if (columnId) {
+      targetColumnId = columnId;
+    } else if (columnName) {
+      const cols = kanbanDB.getColumnsForBoard(board.id);
+      const matched = cols.find(
+        (c) => c.name.toLowerCase() === columnName.toLowerCase()
+      );
+      if (!matched) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Error: Could not find column named "${columnName}" in board "${board.name}". Available: ${cols
+                .map((c) => c.name)
+                .join(", ")}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+      targetColumnId = matched.id;
+    } else {
+      targetColumnId = board.landing_column_id ?? undefined;
+    }
+
+    if (!targetColumnId) {
       return {
         content: [
           {
@@ -91,25 +130,37 @@ mcpServer.tool(
       };
     }
 
-    // Find the landing column
-    const column = kanbanDB.getColumnById(board.landing_column_id);
+    const column = kanbanDB.getColumnById(targetColumnId);
 
-    if (!column) {
+    if (!column || column.board_id !== board.id) {
       return {
         content: [
           {
             type: "text",
-            text: `Error: Could not find landing column with ID: ${board.landing_column_id}`,
+            text: `Error: Could not find column "${columnId ?? columnName}" in board "${board.name}".`,
           },
         ],
         isError: true,
       };
     }
 
+    const metadataStr =
+      metadata === undefined || metadata === null
+        ? undefined
+        : typeof metadata === "string"
+        ? metadata
+        : JSON.stringify(metadata);
+
     let task;
 
     try {
-      task = kanbanDB.addTaskToColumn(board.landing_column_id, title, content);
+      task = kanbanDB.addTaskToColumn(
+        targetColumnId,
+        title,
+        content,
+        priority,
+        metadataStr
+      );
     } catch (error) {
       if (error instanceof ColumnCapacityFullError) {
         return {
@@ -138,16 +189,18 @@ mcpServer.tool(
       content: [
         {
           type: "text",
-          text: `Added task "${title}" to "${column.name}" column in board "${board.name}".\n\nTask ID: ${task.id}\nColumn ID: ${board.landing_column_id}\nBoard ID: ${boardId}\nPosition: ${task.position}\n\n${content}`,
+          text: `Added task "${title}" to "${column.name}" column in board "${board.name}".\n\nTask ID: ${task.id}\nColumn ID: ${targetColumnId}\nBoard ID: ${board.id}\nPosition: ${task.position}${priority ? `\nPriority: ${priority}` : ""}\n\n${content}`,
         },
       ],
       taskInfo: {
         id: task.id,
-        columnId: board.landing_column_id,
-        boardId,
+        columnId: targetColumnId,
+        boardId: board.id,
         title,
         content,
         position: task.position,
+        priority,
+        metadata: metadataStr,
         createdAt: task.created_at,
         updatedAt: task.updated_at,
       },
@@ -192,6 +245,28 @@ mcpServer.tool(
     }
 
     let resolvedTargetColumnId = targetColumnId;
+
+    // If both id and name are provided, they must agree
+    if (targetColumnId && targetColumnName) {
+      const sourceCol = kanbanDB.getColumnById(task.column_id);
+      if (sourceCol) {
+        const cols = kanbanDB.getColumnsForBoard(sourceCol.board_id);
+        const byName = cols.find(
+          (c) => c.name.toLowerCase() === targetColumnName.toLowerCase()
+        );
+        if (byName && byName.id !== targetColumnId) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Error: targetColumnId "${targetColumnId}" does not match targetColumnName "${targetColumnName}".`,
+              },
+            ],
+            isError: true,
+          };
+        }
+      }
+    }
 
     if (!resolvedTargetColumnId && targetColumnName) {
       const sourceColumnForBoard = kanbanDB.getColumnById(task.column_id);
@@ -290,11 +365,15 @@ mcpServer.tool(
       kanbanDB.moveTask(taskId, resolvedTargetColumnId!, reason);
     } catch (error) {
       if (error instanceof ColumnCapacityFullError) {
+        const existing = kanbanDB
+          .getTasksForColumn(resolvedTargetColumnId!)
+          .map((t) => `${t.title} (${t.id})`)
+          .join("; ");
         return {
           content: [
             {
               type: "text",
-              text: `Error: ${error.message}. Work on tasks in the "${targetColumn.name}" column first.`,
+              text: `Error: ${error.message}. Work on tasks in the "${targetColumn.name}" column first. Current tasks there: ${existing || "(none)"}.`,
             },
           ],
           isError: true,
@@ -363,28 +442,28 @@ mcpServer.tool(
     boardId: z.string(),
   },
   async ({ boardId }) => {
-    const board = kanbanDB.getBoardById(boardId);
+    const board = resolveBoard(boardId);
 
     if (!board) {
       return {
         content: [
           {
             type: "text",
-            text: `Error: Could not find board with ID: ${boardId}`,
+            text: `Error: Could not find board with ID or name: ${boardId}`,
           },
         ],
         isError: true,
       };
     }
 
-    const changes = kanbanDB.deleteBoard(boardId);
+    const changes = kanbanDB.deleteBoard(board.id);
 
     if (changes) {
       return {
         content: [
           {
             type: "text",
-            text: `Deleted board "${board.name}" (ID: ${boardId}) and all its columns and tasks.`,
+            text: `Deleted board "${board.name}" (ID: ${board.id}) and all its columns and tasks.`,
           },
         ],
       };
@@ -403,6 +482,112 @@ mcpServer.tool(
 );
 
 mcpServer.tool(
+  "archive-board",
+  "Archive a kanban board (mark it status=archived) without deleting its data. Archived boards are hidden from list-boards unless includeArchived is true.",
+  {
+    boardId: z.string(),
+  },
+  async ({ boardId }) => {
+    const board = resolveBoard(boardId);
+
+    if (!board) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error: Could not find board with ID or name: ${boardId}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    const changes = kanbanDB.archiveBoard(board.id);
+
+    if (changes) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Archived board "${board.name}" (ID: ${board.id}).`,
+          },
+        ],
+      };
+    }
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Error: Could not archive board with ID: ${boardId}`,
+        },
+      ],
+      isError: true,
+    };
+  }
+);
+
+mcpServer.tool(
+  "update-task",
+  "Update a task's content, position, priority, or metadata. Only provide the fields you want to change.",
+  {
+    taskId: z.string(),
+    content: z.string().optional(),
+    position: z.number().int().optional(),
+    priority: z.string().optional(),
+    metadata: z.any().optional(),
+  },
+  async ({ taskId, content, position, priority, metadata }) => {
+    const task = kanbanDB.getTaskById(taskId);
+
+    if (!task) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error: Could not find task with ID: ${taskId}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    const metadataStr =
+      metadata === undefined || metadata === null
+        ? undefined
+        : typeof metadata === "string"
+        ? metadata
+        : JSON.stringify(metadata);
+
+    const updated = kanbanDB.updateTask(
+      taskId,
+      content !== undefined ? content : task.content,
+      position,
+      priority,
+      metadataStr
+    );
+
+    if (!updated) {
+      return {
+        content: [
+          { type: "text", text: `Error: Could not update task with ID: ${taskId}` },
+        ],
+        isError: true,
+      };
+    }
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Updated task "${updated.title}" (ID: ${updated.id}).${position !== undefined ? ` New position: ${updated.position}.` : ""}${priority ? ` New priority: ${updated.priority}.` : ""}`,
+        },
+      ],
+    };
+  }
+);
+
+mcpServer.tool(
   "get-board-info",
   "Get the full info of a kanban board, including columns and tasks (without task content). Set includeContent to true to also include each task's content.",
   {
@@ -410,14 +595,17 @@ mcpServer.tool(
     includeContent: z.boolean().optional(),
   },
   async ({ boardId, includeContent }) => {
-    const boardData = kanbanDB.getBoardWithColumnsAndTasks(boardId);
+    const resolved = resolveBoard(boardId);
+    const boardData = resolved
+      ? kanbanDB.getBoardWithColumnsAndTasks(resolved.id)
+      : undefined;
 
     if (!boardData) {
       return {
         content: [
           {
             type: "text",
-            text: `Error: Could not find board with ID: ${boardId}`,
+            text: `Error: Could not find board with ID or name: ${boardId}`,
           },
         ],
         isError: true,
@@ -441,6 +629,7 @@ mcpServer.tool(
                 createdAt: string;
                 updatedAt: string;
                 updateReason?: string;
+                priority?: string;
               }) => {
                 let taskInfo = `- ${task.title} (ID: ${task.id}, Position: ${
                   task.position
@@ -452,12 +641,19 @@ mcpServer.tool(
                   taskInfo += `, Update reason: ${task.updateReason}`;
                 }
 
+                if (task.priority) {
+                  taskInfo += `, Priority: ${task.priority}`;
+                }
+
                 taskInfo += ")";
 
                 if (includeContent) {
                   const full = kanbanDB.getTaskById(task.id);
                   if (full) {
                     taskInfo += `\n  Content: ${full.content.replace(/\n/g, "\n  ")}`;
+                    if (full.metadata) {
+                      taskInfo += `\n  Metadata: ${full.metadata}`;
+                    }
                   }
                 }
 
@@ -478,7 +674,7 @@ mcpServer.tool(
           } columns and ${columns.reduce(
             (total: number, col: ColumnWithTasks) => total + col.tasks.length,
             0
-          )} tasks.`,
+          )} tasks.\nBoard ID: ${board.id}\nStatus: ${board.status ?? "active"}`,
         },
         {
           type: "text",
@@ -520,6 +716,14 @@ mcpServer.tool(
       responseText += `\n\nUpdate reason: ${task.update_reason}`;
     }
 
+    if (task.priority) {
+      responseText += `\n\nPriority: ${task.priority}`;
+    }
+
+    if (task.metadata) {
+      responseText += `\n\nMetadata: ${task.metadata}`;
+    }
+
     return {
       content: [
         {
@@ -533,10 +737,10 @@ mcpServer.tool(
 
 mcpServer.tool(
   "list-boards",
-  "List all kanban boards in the database: Name, creation time, and goal.",
-  {},
-  async () => {
-    const boards = kanbanDB.getAllBoards();
+  "List all kanban boards in the database: Name, creation time, goal, and status. Pass includeArchived=true to also list archived boards.",
+  { includeArchived: z.boolean().optional() },
+  async ({ includeArchived }) => {
+    const boards = kanbanDB.getAllBoards(includeArchived ?? false);
 
     if (boards.length === 0) {
       return {
@@ -556,10 +760,11 @@ mcpServer.tool(
           id: string;
           created_at: string;
           goal: string;
+          status?: string;
         }) =>
           `- ${board.name} (ID: ${board.id}, Created At: ${dayjs(
             board.created_at
-          ).fromNow()}, Goal: ${board.goal})`
+          ).fromNow()}, Status: ${board.status ?? "active"}, Goal: ${board.goal})`
       )
       .join("\n");
 

@@ -20,6 +20,7 @@ export interface Board {
   name: string;
   goal: string;
   landing_column_id: string | null;
+  status: string;
   created_at: string;
   updated_at: string;
 }
@@ -42,6 +43,8 @@ export interface Task {
   created_at: string;
   updated_at: string;
   update_reason?: string;
+  metadata?: string;
+  priority?: string;
 }
 
 export interface TaskSummary {
@@ -51,6 +54,8 @@ export interface TaskSummary {
   createdAt: string;
   updatedAt: string;
   updateReason?: string;
+  priority?: string;
+  metadata?: string;
 }
 
 export interface ColumnWithTasks {
@@ -101,13 +106,13 @@ export class KanbanDB {
     const transaction = this.db.transaction(() => {
       // Insert the new board into the database (without landing column for now)
       const insertBoardStmt = this.db.prepare<
-        [string, string, string, string, string]
+        [string, string, string, string, string, string]
       >(`
-        INSERT INTO boards (id, name, goal, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO boards (id, name, goal, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
       `);
 
-      insertBoardStmt.run(boardId, name, projectGoal, now, now);
+      insertBoardStmt.run(boardId, name, projectGoal, "active", now, now);
 
       const insertColumnStmt = this.db.prepare<
         [string, string, string, number, number, number]
@@ -150,7 +155,7 @@ export class KanbanDB {
 
   public getBoardById(boardId: string): Board | undefined {
     const findBoardStmt = this.db.prepare<[string], Board>(`
-      SELECT id, name, goal, landing_column_id, created_at, updated_at 
+      SELECT id, name, goal, landing_column_id, status, created_at, updated_at 
       FROM boards 
       WHERE id = ?
     `);
@@ -170,7 +175,7 @@ export class KanbanDB {
 
   public getTaskById(taskId: string): Task | undefined {
     const findTaskStmt = this.db.prepare<[string], Task>(`
-      SELECT id, column_id, title, content, position, created_at, updated_at, update_reason
+      SELECT id, column_id, title, content, position, created_at, updated_at, update_reason, metadata, priority
       FROM tasks 
       WHERE id = ?
     `);
@@ -191,7 +196,9 @@ export class KanbanDB {
   public addTaskToColumn(
     columnId: string,
     title: string,
-    content: string
+    content: string,
+    priority?: string,
+    metadata?: string
   ): Task {
     // Get the column
     const column = this.getColumnById(columnId);
@@ -212,13 +219,13 @@ export class KanbanDB {
     const position = taskCount;
 
     const insertTaskStmt = this.db.prepare<
-      [string, string, string, string, number, string, string]
+      [string, string, string, string, number, string, string, string | null, string | null]
     >(`
-      INSERT INTO tasks (id, column_id, title, content, position, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO tasks (id, column_id, title, content, position, created_at, updated_at, priority, metadata)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
-    insertTaskStmt.run(taskId, columnId, title, content, position, now, now);
+    insertTaskStmt.run(taskId, columnId, title, content, position, now, now, priority ?? null, metadata ?? null);
 
     return {
       id: taskId,
@@ -228,6 +235,8 @@ export class KanbanDB {
       position,
       created_at: now,
       updated_at: now,
+      priority,
+      metadata,
     };
   }
 
@@ -279,9 +288,11 @@ export class KanbanDB {
         created_at: string;
         updated_at: string;
         update_reason?: string;
+        metadata?: string;
+        priority?: string;
       }
     >(`
-      SELECT id, title, position, created_at, updated_at, update_reason
+      SELECT id, title, position, created_at, updated_at, update_reason, metadata, priority
       FROM tasks
       WHERE column_id = ?
       ORDER BY position ASC
@@ -296,6 +307,8 @@ export class KanbanDB {
       createdAt: task.created_at,
       updatedAt: task.updated_at,
       updateReason: task.update_reason,
+      metadata: task.metadata,
+      priority: task.priority,
     }));
   }
 
@@ -327,17 +340,48 @@ export class KanbanDB {
     return { board, columns: columnsWithTasks };
   }
 
-  public getAllBoards(): Board[] {
+  public getAllBoards(includeArchived = false): Board[] {
+    if (includeArchived) {
+      const findBoardsStmt = this.db.prepare<[], Board>(`
+        SELECT id, name, goal, landing_column_id, status, created_at, updated_at
+        FROM boards
+        ORDER BY created_at DESC
+      `);
+      return findBoardsStmt.all();
+    }
+
     const findBoardsStmt = this.db.prepare<[], Board>(`
-      SELECT id, name, goal, landing_column_id, created_at, updated_at
+      SELECT id, name, goal, landing_column_id, status, created_at, updated_at
       FROM boards
+      WHERE status IS NULL OR status != 'archived'
       ORDER BY created_at DESC
     `);
 
     return findBoardsStmt.all();
   }
 
-  public updateTask(taskId: string, content: string): Task | undefined {
+  public getBoardByName(name: string): Board | undefined {
+    const findBoardStmt = this.db.prepare<[string], Board>(`
+      SELECT id, name, goal, landing_column_id, status, created_at, updated_at
+      FROM boards
+      WHERE name = ?
+      ORDER BY created_at DESC
+      LIMIT 1
+    `);
+
+    return findBoardStmt.get(name);
+  }
+
+  public archiveBoard(boardId: string): number {
+    const stmt = this.db.prepare<[string, string]>(`
+      UPDATE boards SET status = 'archived', updated_at = ? WHERE id = ?
+    `);
+    const now = new Date().toISOString();
+    const res = stmt.run(now, boardId);
+    return res.changes;
+  }
+
+  public updateTask(taskId: string, content: string, position?: number, priority?: string, metadata?: string): Task | undefined {
     // Get the task
     const task = this.getTaskById(taskId);
     if (!task) {
@@ -346,18 +390,21 @@ export class KanbanDB {
 
     const now = new Date().toISOString();
 
-    const updateTaskStmt = this.db.prepare<[string, string, string]>(`
+    const updateTaskStmt = this.db.prepare<[string, number | null, string | null, string | null, string, string]>(`
       UPDATE tasks
-      SET content = ?, updated_at = ?
+      SET content = ?, position = COALESCE(?, position), priority = COALESCE(?, priority), metadata = COALESCE(?, metadata), updated_at = ?
       WHERE id = ?
     `);
 
-    updateTaskStmt.run(content, now, taskId);
+    updateTaskStmt.run(content, position ?? null, priority ?? null, metadata ?? null, now, taskId);
 
     // Return the updated task
     return {
       ...task,
       content,
+      position: position ?? task.position,
+      priority: priority ?? task.priority,
+      metadata: metadata ?? task.metadata,
       updated_at: now
     };
   }
@@ -448,6 +495,18 @@ export class KanbanDB {
         FOREIGN KEY (column_id) REFERENCES columns(id)
       );
     `);
+
+    // Idempotent migrations for newer columns on older DB files
+    const safeAddColumn = (sql: string) => {
+      try {
+        this.db.exec(sql);
+      } catch {
+        // column already exists
+      }
+    };
+    safeAddColumn(`ALTER TABLE tasks ADD COLUMN priority TEXT`);
+    safeAddColumn(`ALTER TABLE boards ADD COLUMN status TEXT DEFAULT 'active'`);
+    this.db.exec(`UPDATE boards SET status = 'active' WHERE status IS NULL`);
   }
 }
 
